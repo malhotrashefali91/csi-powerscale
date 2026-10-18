@@ -27,12 +27,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/cucumber/godog"
 	"github.com/dell/csi-powerscale/v2/common/constants"
 	"github.com/dell/csi-powerscale/v2/service/collectors"
 	isi "github.com/dell/gopowerscale"
 	isimocks "github.com/dell/gopowerscale/mocks"
-	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/cucumber/godog"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/stretchr/testify/assert"
@@ -1857,6 +1857,89 @@ func TestCleanupNodeFromSharedExports_PVListError(t *testing.T) {
 	}
 	err := svc.cleanupNodeFromSharedExports(ctx, node)
 	assert.Error(t, err)
+}
+
+func TestRetryNodeExportCleanup(t *testing.T) {
+	t.Run("retries transient failure", func(t *testing.T) {
+		attempts := 0
+		err := retryNodeExportCleanup(context.Background(), 3, 0, func() error {
+			attempts++
+			if attempts < 3 {
+				return errors.New("temporary array error")
+			}
+			return nil
+		})
+
+		assert.NoError(t, err)
+		assert.Equal(t, 3, attempts)
+	})
+
+	t.Run("returns failure after exhausting attempts", func(t *testing.T) {
+		attempts := 0
+		err := retryNodeExportCleanup(context.Background(), 3, 0, func() error {
+			attempts++
+			return errors.New("array unavailable")
+		})
+
+		assert.ErrorContains(t, err, "cleanup failed after 3 attempts")
+		assert.Equal(t, 3, attempts)
+	})
+}
+
+func TestCleanupNodeFromSharedExportsScopesExportsByCluster(t *testing.T) {
+	ctx := context.Background()
+	newDirectoryPV := func(name, cluster string) *v1.PersistentVolume {
+		return &v1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: v1.PersistentVolumeSpec{
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					CSI: &v1.CSIPersistentVolumeSource{
+						Driver:           constants.PluginName,
+						VolumeHandle:     fmt.Sprintf("%s=_=_=50=_=_=System=_=_=%s=_=_=directory", name, cluster),
+						VolumeAttributes: map[string]string{"ProvisioningMode": "directory"},
+					},
+				},
+			},
+		}
+	}
+
+	cluster1Client := &isimocks.Client{}
+	cluster2Client := &isimocks.Client{}
+	for _, client := range []*isimocks.Client{cluster1Client, cluster2Client} {
+		client.On("Get", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+		client.On("Put", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	}
+
+	falseVal := false
+	clusters := &sync.Map{}
+	clusters.Store("cluster1", &IsilonClusterConfig{
+		ClusterName:             "cluster1",
+		IgnoreUnresolvableHosts: &falseVal,
+		isiSvc:                  &isiService{client: &isi.Client{API: cluster1Client}},
+	})
+	clusters.Store("cluster2", &IsilonClusterConfig{
+		ClusterName:             "cluster2",
+		IgnoreUnresolvableHosts: &falseVal,
+		isiSvc:                  &isiService{client: &isi.Client{API: cluster2Client}},
+	})
+
+	svc := &service{
+		k8sclient:         fake.NewSimpleClientset(newDirectoryPV("pv-cluster1", "cluster1"), newDirectoryPV("pv-cluster2", "cluster2")),
+		directoryExportMu: sync.Map{},
+		isiClusters:       clusters,
+	}
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "deleted-node"},
+		Status: v1.NodeStatus{Addresses: []v1.NodeAddress{
+			{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+		}},
+	}
+
+	err := svc.cleanupNodeFromSharedExports(ctx, node)
+
+	require.NoError(t, err)
+	require.NotEmpty(t, cluster1Client.Calls, "cluster1 export should be cleaned")
+	require.NotEmpty(t, cluster2Client.Calls, "cluster2 export should be cleaned despite matching export ID and access zone")
 }
 
 func TestCleanupNodeFromSharedExports_WithDirectoryPVs(t *testing.T) {

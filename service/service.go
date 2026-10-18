@@ -42,6 +42,7 @@ import (
 	fromctx "github.com/dell/csi-powerscale/v2/common/utils/fromcontext"
 	id "github.com/dell/csi-powerscale/v2/common/utils/identifiers"
 
+	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/dell/csi-powerscale/v2/core"
 	commonext "github.com/dell/dell-csi-extensions/common"
 	podmon "github.com/dell/dell-csi-extensions/podmon"
@@ -50,7 +51,6 @@ import (
 	csictx "github.com/dell/gocsi/context"
 	isi "github.com/dell/gopowerscale"
 	"github.com/dell/gopowerscale/api"
-	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/fsnotify/fsnotify"
 
 	csmlog "github.com/dell/csmlog"
@@ -1912,6 +1912,11 @@ func (s *service) watchNodeDeletions(ctx context.Context) {
 
 // cleanupNodeFromSharedExports removes a deleted node's IP from all shared export client lists
 func (s *service) cleanupNodeFromSharedExports(ctx context.Context, node *corev1.Node) error {
+	const (
+		cleanupMaxAttempts = 3
+		cleanupRetryDelay  = 250 * time.Millisecond
+	)
+
 	// Get node IP addresses
 	var nodeIPs []string
 	for _, addr := range node.Status.Addresses {
@@ -1934,7 +1939,7 @@ func (s *service) cleanupNodeFromSharedExports(ctx context.Context, node *corev1
 		return fmt.Errorf("failed to list PVs: %w", err)
 	}
 
-	// Track unique shared exports (exportID:accessZone)
+	// Track unique shared exports per cluster (cluster:exportID:accessZone).
 	sharedExports := make(map[string]struct {
 		exportID    int
 		accessZone  string
@@ -1957,7 +1962,7 @@ func (s *service) cleanupNodeFromSharedExports(ctx context.Context, node *corev1
 			continue
 		}
 
-		exportKey := fmt.Sprintf("%d:%s", exportID, accessZone)
+		exportKey := fmt.Sprintf("%s:%d:%s", clusterName, exportID, accessZone)
 		sharedExports[exportKey] = struct {
 			exportID    int
 			accessZone  string
@@ -1967,24 +1972,26 @@ func (s *service) cleanupNodeFromSharedExports(ctx context.Context, node *corev1
 
 	// Remove node IPs from each shared export
 	cleanupCount := 0
+	var cleanupErrors []error
 	for exportKey, export := range sharedExports {
 		// Acquire per-export mutex
 		muVal, _ := s.directoryExportMu.LoadOrStore(exportKey, &sync.RWMutex{})
 		mu := muVal.(*sync.RWMutex)
 		mu.Lock()
 
-		// Get cluster config
-		isiConfig, err := s.getIsilonConfig(ctx, &export.clusterName)
-		if err != nil {
-			csmlog.WithContext(ctx).Warnf("Failed to get config for cluster %s: %v", export.clusterName, err)
-			mu.Unlock()
-			continue
-		}
+		cleanupErr := retryNodeExportCleanup(ctx, cleanupMaxAttempts, cleanupRetryDelay, func() error {
+			isiConfig, err := s.getIsilonConfig(ctx, &export.clusterName)
+			if err != nil {
+				return fmt.Errorf("get config for cluster %s: %w", export.clusterName, err)
+			}
+			return isiConfig.isiSvc.RemoveExportClientByIPsWithZone(ctx, export.exportID, export.accessZone, nodeIPs, false)
+		})
+		mu.Unlock()
 
-		// Remove node IPs from export client list
-		removeErr := isiConfig.isiSvc.RemoveExportClientByIPsWithZone(ctx, export.exportID, export.accessZone, nodeIPs, false)
-		if removeErr != nil {
-			csmlog.WithContext(ctx).Warnf("Failed to remove IPs %v from export %d (zone: %s): %v", nodeIPs, export.exportID, export.accessZone, removeErr)
+		if cleanupErr != nil {
+			wrappedErr := fmt.Errorf("failed to remove IPs %v from export %d (zone: %s, cluster: %s): %w", nodeIPs, export.exportID, export.accessZone, export.clusterName, cleanupErr)
+			csmlog.WithContext(ctx).Warnf("%v", wrappedErr)
+			cleanupErrors = append(cleanupErrors, wrappedErr)
 		} else {
 			csmlog.WithContext(ctx).WithFields(csmlog.Fields{
 				"nodeIPs":    nodeIPs,
@@ -1994,8 +2001,6 @@ func (s *service) cleanupNodeFromSharedExports(ctx context.Context, node *corev1
 			}).Info("Removed stale node IPs from shared export")
 			cleanupCount += len(nodeIPs)
 		}
-
-		mu.Unlock()
 	}
 
 	csmlog.WithContext(ctx).WithFields(csmlog.Fields{
@@ -2005,5 +2010,35 @@ func (s *service) cleanupNodeFromSharedExports(ctx context.Context, node *corev1
 		"exportCount":  len(sharedExports),
 	}).Info("Completed stale IP cleanup for deleted node")
 
-	return nil
+	return errors.Join(cleanupErrors...)
+}
+
+func retryNodeExportCleanup(ctx context.Context, maxAttempts int, initialDelay time.Duration, cleanup func() error) error {
+	if maxAttempts < 1 {
+		return fmt.Errorf("max attempts must be positive, got %d", maxAttempts)
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(lastErr, err)
+		}
+		if lastErr = cleanup(); lastErr == nil {
+			return nil
+		}
+		if attempt == maxAttempts {
+			break
+		}
+
+		delay := initialDelay * time.Duration(attempt)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(lastErr, ctx.Err())
+		case <-timer.C:
+		}
+	}
+
+	return fmt.Errorf("cleanup failed after %d attempts: %w", maxAttempts, lastErr)
 }
