@@ -77,19 +77,20 @@ func mainR(runFunc func(ctx context.Context, name, desc string, usage string, sp
 	}
 
 	enableLeaderElection := flag.Bool("leader-election", false, "Enables leader election.")
-	csmlog.Info("Enabling leader election")
 	leaderElectionNamespace := flag.String("leader-election-namespace", "", "The namespace where leader election lease will be created. Defaults to the pod namespace if not set.")
-	csmlog.Info("leader-election-namespace = " + *leaderElectionNamespace)
 	leaderElectionLeaseDuration := flag.Duration("leader-election-lease-duration", 15*time.Second, "Duration, in seconds, that non-leader candidates will wait to force acquire leadership")
-	csmlog.Info("leader-election-lease-duration = " + leaderElectionLeaseDuration.String())
 	leaderElectionRenewDeadline := flag.Duration("leader-election-renew-deadline", 10*time.Second, "Duration, in seconds, that the acting leader will retry refreshing leadership before giving up.")
-	csmlog.Info("leader-election-renew-deadline = " + leaderElectionRenewDeadline.String())
 	leaderElectionRetryPeriod := flag.Duration("leader-election-retry-period", 5*time.Second, "Duration, in seconds, the LeaderElector clients should wait between tries of actions")
-	csmlog.Info("leader-election-retry-period = " + leaderElectionRetryPeriod.String())
 	driverConfigParamsfile := flag.String("driver-config-params", "", "yaml file with driver config params")
-	csmlog.Info("driver-config-params = " + *driverConfigParamsfile)
 	kubeconfig := flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.Parse()
+
+	csmlog.Info("Enabling leader election")
+	csmlog.Info("leader-election-namespace = " + *leaderElectionNamespace)
+	csmlog.Info("leader-election-lease-duration = " + leaderElectionLeaseDuration.String())
+	csmlog.Info("leader-election-renew-deadline = " + leaderElectionRenewDeadline.String())
+	csmlog.Info("leader-election-retry-period = " + leaderElectionRetryPeriod.String())
+	csmlog.Info("driver-config-params = " + *driverConfigParamsfile)
 
 	validateArgs(driverConfigParamsfile)
 	service.DriverConfigParamsFile = *driverConfigParamsfile
