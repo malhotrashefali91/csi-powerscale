@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"os"
 	"path"
@@ -2016,8 +2017,14 @@ func (s *service) ControllerExpandVolume(
 			return nil, status.Errorf(codes.Internal, "Hard limit is 0, cannot proceed with volume expansion")
 		}
 
-		updatedSoftLimit := quotaSizeSoft * (requiredBytes / quotaSizeHard)
-		updatedAdvisoryLimit := quotaSizeAdvisory * (requiredBytes / quotaSizeHard)
+		updatedSoftLimit, err := scaleQuotaLimit(quotaSizeSoft, quotaSizeHard, requiredBytes)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to scale soft quota limit: %v", err)
+		}
+		updatedAdvisoryLimit, err := scaleQuotaLimit(quotaSizeAdvisory, quotaSizeHard, requiredBytes)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to scale advisory quota limit: %v", err)
+		}
 
 		if err = isiConfig.isiSvc.UpdateQuotaSize(ctx, quota.ID, requiredBytes, updatedSoftLimit, updatedAdvisoryLimit, quotaSoftGrace); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to update quota: %v", err)
@@ -2025,6 +2032,20 @@ func (s *service) ControllerExpandVolume(
 	}
 
 	return &csi.ControllerExpandVolumeResponse{CapacityBytes: requiredBytes, NodeExpansionRequired: false}, nil
+}
+
+func scaleQuotaLimit(limit, currentHard, newHard int64) (int64, error) {
+	if currentHard <= 0 {
+		return 0, fmt.Errorf("current hard limit must be positive, got %d", currentHard)
+	}
+
+	var scaled big.Int
+	scaled.Mul(big.NewInt(limit), big.NewInt(newHard))
+	scaled.Quo(&scaled, big.NewInt(currentHard))
+	if !scaled.IsInt64() {
+		return 0, fmt.Errorf("scaled quota limit exceeds int64 range")
+	}
+	return scaled.Int64(), nil
 }
 
 type exportClientAdders struct {

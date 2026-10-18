@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/dell/csi-powerscale/v2/common/constants"
 	"github.com/dell/csi-powerscale/v2/common/utils/identifiers"
 	isi "github.com/dell/gopowerscale"
@@ -35,7 +36,6 @@ import (
 	v1 "github.com/dell/gopowerscale/api/v1"
 	v2 "github.com/dell/gopowerscale/api/v2"
 	isimocks "github.com/dell/gopowerscale/mocks"
-	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -2616,6 +2616,51 @@ func TestControllerUnpublishVolume(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Errorf("TestControllerUnpublishVolume() error = %v, wantErr %v", err, tt.wantErr)
 			}
+		})
+	}
+}
+
+func TestScaleQuotaLimit(t *testing.T) {
+	tests := []struct {
+		name        string
+		limit       int64
+		currentHard int64
+		newHard     int64
+		want        int64
+		wantErr     bool
+	}{
+		{
+			name:        "scales fractional growth proportionally",
+			limit:       500,
+			currentHard: 1000,
+			newHard:     1500,
+			want:        750,
+		},
+		{
+			name:        "avoids intermediate multiplication overflow",
+			limit:       int64(^uint64(0) >> 1),
+			currentHard: int64(^uint64(0) >> 1),
+			newHard:     int64(^uint64(0) >> 1),
+			want:        int64(^uint64(0) >> 1),
+		},
+		{
+			name:        "rejects non-positive current hard limit",
+			limit:       500,
+			currentHard: 0,
+			newHard:     1500,
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := scaleQuotaLimit(tt.limit, tt.currentHard, tt.newHard)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
